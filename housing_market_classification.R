@@ -464,3 +464,19 @@ plot(roc_obj)
 
 summary(model_final4)
 
+# The final logistic regression model achieved approximately:
+# - 71.5% test accuracy
+# - 0.663 sensitivity
+# - 0.744 specificity
+# - 0.77 AUC
+
+# Inventory levels, transaction speed, and market heat indicators
+# were among the strongest predictors of housing market growth.
+
+# Interaction effects improved model fit, suggesting that the effect
+# of pricing competitiveness and pending days depends partly on overall
+# market heat conditions.
+
+# Overall, the model demonstrated moderate predictive ability while
+# remaining interpretable and statistically stable.
+
