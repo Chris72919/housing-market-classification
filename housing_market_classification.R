@@ -1,8 +1,7 @@
 # Zillow Housing Market Classification
 # Author: Christian Lopez
-# Description:
-# This project builds a logistic regression model to classify metro housing markets
-# as above-median growth ("hot") using Zillow housing indicators.
+# Goal: classify a metro-month as above the historical training-period median
+# month-over-month ZHVI growth, using contemporaneous market indicators.
 
 # Libraries ####
 library(readr)
@@ -13,470 +12,283 @@ library(corrplot)
 library(car)
 library(ggplot2)
 
-# Adding, altering, and merging datasets ####
-# Adding datasets
-zhvi <- read_csv("Data/Metro_zhvi_uc_sfrcondo_tier_0.33_0.67_sm_sa_month.csv")
-listings <- read_csv("Data/Metro_new_listings_uc_sfrcondo_month.csv")
-inventory <- read_csv("Data/Metro_invt_fs_uc_sfrcondo_month.csv")
-days_pending <- read_csv("Data/Metro_med_doz_pending_uc_sfrcondo_month.csv")
-
-# Inspecting datasets
-# Has a primary key that can be used to merge (RegionID main) 
-# (SizeRank and RegionName could be used as alt keys but unlikely to use)
-head(zhvi) # Starts in 2001 instead of 2018 have to filter out
-head(listings)
-head(inventory)
-head(days_pending)
-
-# Only keeping metros 
-zhvi <- zhvi %>% filter(RegionType == "msa")
-listings <- listings %>% filter(RegionType == "msa")
-inventory <- inventory %>% filter(RegionType == "msa")
-days_pending <- days_pending %>% filter(RegionType == "msa")
-
-# Long format (puts all dates under one column so that each row is one obs.)
-# Likely a composite key of (RegionID, Date) now (Maybe RegionName can be used if unique)
-zhvi_long <- zhvi %>%
-  pivot_longer(
-    cols = starts_with("20"),
-    names_to = "date",
-    values_to = "price"
-  )
-
-listings_long <- listings %>%
-  pivot_longer(
-    cols = starts_with("20"),
-    names_to = "date",
-    values_to = "new_listings"
-  )
-
-inventory_long <- inventory %>%
-  pivot_longer(
-    cols = starts_with("20"),
-    names_to = "date",
-    values_to = "inventory"
-  )
-
-days_long <- days_pending %>%
-  pivot_longer(
-    cols = starts_with("20"),
-    names_to = "date",
-    values_to = "days_pending"
-  )
-
-# Changing date class from character to date
-zhvi_long$date <- as.Date(zhvi_long$date)
-listings_long$date <- as.Date(listings_long$date)
-inventory_long$date <- as.Date(inventory_long$date)
-days_long$date <- as.Date(days_long$date)
-
-# Giving all datasets same start date (should only change zhvi)
+# Data loading and reshaping ####
 start_date <- as.Date("2018-01-01")
+cutoff_date <- as.Date("2022-01-01")
 
-zhvi_long <- zhvi_long %>% filter(date >= start_date)
-listings_long <- listings_long %>% filter(date >= start_date)
-inventory_long <- inventory_long %>% filter(date >= start_date)
-days_long <- days_long %>% filter(date >= start_date)
+to_long <- function(path, value_name) {
+  read_csv(path, show_col_types = FALSE) %>%
+    filter(RegionType == "msa") %>%
+    pivot_longer(
+      cols = starts_with("20"),
+      names_to = "date",
+      values_to = value_name
+    ) %>%
+    mutate(date = as.Date(date)) %>%
+    select(RegionID, date, all_of(value_name))
+}
 
-# Cleaning (removing unneeded columns) (SizeRank, RegionType, StateName)
-zhvi_long <- zhvi_long %>% select(RegionID, RegionName, date, price)
-listings_long <- listings_long %>% select(RegionID, RegionName, date, new_listings)
-inventory_long <- inventory_long %>% select(RegionID, RegionName, date, inventory)
-days_long <- days_long %>% select(RegionID, RegionName, date, days_pending)
+# Read ZHVI independently so growth is calculated on consecutive calendar months
+# BEFORE other datasets are joined or rows with missing predictors are removed.
+zhvi <- read_csv(
+  "Data/Metro_zhvi_uc_sfrcondo_tier_0.33_0.67_sm_sa_month.csv",
+  show_col_types = FALSE
+)
 
-# Merging with inner joins using composite key (RegionID, Date)
+zhvi_long <- zhvi %>%
+  filter(RegionType == "msa") %>%
+  pivot_longer(cols = starts_with("20"), names_to = "date", values_to = "price") %>%
+  mutate(date = as.Date(date)) %>%
+  select(RegionID, region = RegionName, date, price) %>%
+  arrange(RegionID, date) %>%
+  group_by(RegionID) %>%
+  mutate(
+    previous_date = lag(date),
+    price_lag = lag(price)
+  ) %>%
+  ungroup()
+
+# Vectorized calendar-month check; varying month lengths do not matter.
+# Months are encoded as year*12 + month, avoiding varying month lengths.
+zhvi_long <- zhvi_long %>%
+  mutate(
+    month_index = as.integer(format(date, "%Y")) * 12L +
+      as.integer(format(date, "%m")),
+    previous_month_index = as.integer(format(previous_date, "%Y")) * 12L +
+      as.integer(format(previous_date, "%m")),
+    consecutive_month = !is.na(previous_date) &
+      month_index - previous_month_index == 1L,
+    price_growth = if_else(
+      consecutive_month & !is.na(price_lag) & price_lag > 0,
+      (price - price_lag) / price_lag * 100,
+      NA_real_
+    )
+  ) %>%
+  select(RegionID, region, date, price, price_growth) %>%
+  filter(date >= start_date)
+
+listings_long <- to_long("Data/Metro_new_listings_uc_sfrcondo_month.csv", "new_listings")
+inventory_long <- to_long("Data/Metro_invt_fs_uc_sfrcondo_month.csv", "inventory")
+days_long <- to_long("Data/Metro_med_doz_pending_uc_sfrcondo_month.csv", "days_pending")
+sale_to_list_long <- to_long("Data/Metro_median_sale_to_list_uc_sfrcondo_month.csv", "sale_to_list")
+heat_long <- to_long("Data/Metro_market_temp_index_uc_sfrcondo_month.csv", "market_heat_index")
+
+# Merge on metro ID and month, retaining only months covered by every data source.
 df <- zhvi_long %>%
   inner_join(listings_long, by = c("RegionID", "date")) %>%
   inner_join(inventory_long, by = c("RegionID", "date")) %>%
-  inner_join(days_long, by = c("RegionID", "date"))
-
-# Decided to add two new predictors will
-sale_to_list_long <- read_csv("Data/Metro_median_sale_to_list_uc_sfrcondo_month.csv") %>%
-  filter(RegionType == "msa") %>%
-  pivot_longer(
-    cols = starts_with("20"),
-    names_to = "date",
-    values_to = "sale_to_list"
-  ) %>%
-  mutate(date = as.Date(date)) %>%
-  filter(date >= start_date) %>%
-  select(RegionID, date, sale_to_list)
-
-heat_long <- read_csv("Data/Metro_market_temp_index_uc_sfrcondo_month.csv") %>%
-  filter(RegionType == "msa") %>%
-  pivot_longer(
-    cols = starts_with("20"),
-    names_to = "date",
-    values_to = "market_heat_index"
-  ) %>%
-  mutate(date = as.Date(date)) %>%
-  filter(date >= start_date) %>%
-  select(RegionID, date, market_heat_index)
-
-df <- df %>%
+  inner_join(days_long, by = c("RegionID", "date")) %>%
   inner_join(sale_to_list_long, by = c("RegionID", "date")) %>%
   inner_join(heat_long, by = c("RegionID", "date"))
 
-# Check
-head(df) # Duplicated region name will clean
-
-# Clean duplicates
-# Retained regionname col.
-df <- df %>%
-  rename(region = RegionName.x)
-# Drop others
-df <- df %>%
-  select(RegionID, region, date, price, new_listings, inventory, days_pending,
-        sale_to_list, market_heat_index)
-
-# Adding a region_census predictor
+# Census region is derived from the state abbreviation in the metro name.
+# Multi-state metros are assigned according to the final state abbreviation.
 df <- df %>%
   mutate(
     state = sub(".*,\\s*", "", region),
     region_census = case_when(
-      state %in% c("CT","ME","MA","NH","RI","VT","NJ","NY","PA") ~ "Northeast",
-      state %in% c("IL","IN","MI","OH","WI","IA","KS","MN","MO","NE","ND","SD") ~ "Midwest",
-      state %in% c("DE","FL","GA","MD","NC","SC","VA","DC","WV","AL","KY","MS","TN","AR","LA","OK","TX") ~ "South",
-      state %in% c("AZ","CO","ID","MT","NV","NM","UT","WY","AK","CA","HI","OR","WA") ~ "West",
+      state %in% c("CT", "ME", "MA", "NH", "RI", "VT", "NJ", "NY", "PA") ~ "Northeast",
+      state %in% c("IL", "IN", "MI", "OH", "WI", "IA", "KS", "MN", "MO", "NE", "ND", "SD") ~ "Midwest",
+      state %in% c("DE", "FL", "GA", "MD", "NC", "SC", "VA", "DC", "WV", "AL", "KY", "MS", "TN", "AR", "LA", "OK", "TX") ~ "South",
+      state %in% c("AZ", "CO", "ID", "MT", "NV", "NM", "UT", "WY", "AK", "CA", "HI", "OR", "WA") ~ "West",
       TRUE ~ NA_character_
-    )
-  )
-df$region_census <- as.factor(df$region_census)
-
-# removing state
-df <- df %>% select(-state)
-
-# Check
-head(df) # Looks good
-dim(df) # 50440 10
-summary(df) # lots of NA's will have to look at the nature of them before 
-            # removing as to be informed on what not having them means
-
-# High-coverage macro metros are complete, but lower-activity or thin-market
-# observations are partially unobserved
-
-# Missing values are not randomly distributed but reflect Zillow’s data coverage
-# constraints and reporting thresholds. Variables such as median sale-to-list
-# ratio and days pending are only computed when sufficient underlying
-# transaction volume is available within a metropolitan area-month.
-
-# I will be removing the NA's with the idea that this model focuses on metros
-# with sufficient market activity (high-liquidity housing markets where reliable
-# transaction-based indicators exist)
-
-# dropping nas
-df_model <- df %>% drop_na()
-
-head(df_model)
-summary(df_model)
-
-# Adding response ####
-df_model <- df_model %>%
-  arrange(RegionID, date) %>%
-  group_by(RegionID) %>%
-  mutate(
-    price_lag = lag(price),
-    price_growth = (price - price_lag) / price_lag * 100,
-    hot = ifelse(price_growth > 0, 1, 0)
+    ),
+    region_census = factor(region_census)
   ) %>%
-  ungroup() %>%
-  drop_na(price_lag)
+  select(-state)
 
-# Checking response (imbalanced as most markets are experiencing growth)
-table(df_model$hot)
-mean(df_model$hot)
+# Complete-case analysis: conclusions apply to metro-months with sufficient
+# Zillow data coverage, not necessarily all US housing markets.
+df_model <- df %>%
+  drop_na(price_growth, price, new_listings, inventory, days_pending,
+          sale_to_list, market_heat_index, region_census) %>%
+  filter(price > 0, inventory > 0, days_pending > 0)
 
-# Changing my response to median based. Changes question from Is growth positive?
-# to Is growth above normal? or Is this metro-month performing better than a
-# typical metro-month?
-df_model <- df_model %>%
-  mutate(
-    hot = ifelse(
-      price_growth > median(price_growth, na.rm = TRUE),
-      1, 0
-    )
-  )
+# Chronological split before target threshold, diagnostics, or feature selection ####
+train <- df_model %>% filter(date < cutoff_date)
+test <- df_model %>% filter(date >= cutoff_date)
 
-table(df_model$hot)
-mean(df_model$hot) # balanced
+# Freeze the outcome definition using training data only.
+median_growth <- median(train$price_growth)
+train <- train %>% mutate(hot = as.integer(price_growth > median_growth))
+test <- test %>% mutate(hot = as.integer(price_growth > median_growth))
 
-# Multicollinearity ####
-# Correlation matrix
-vars <- df_model %>%
+cat("Training observations:", nrow(train), "\n")
+cat("Testing observations:", nrow(test), "\n")
+cat("Training-period median monthly growth (%):", round(median_growth, 4), "\n")
+cat("Training class distribution:\n")
+print(table(train$hot))
+cat("Testing class distribution:\n")
+print(table(test$hot))
+
+# Training-only multicollinearity analysis ####
+initial_vars <- train %>%
   select(price, new_listings, inventory, days_pending, sale_to_list, market_heat_index)
-
-corr_matrix <- cor(vars, use = "complete.obs")
-
-corr_matrix
+corr_matrix <- cor(initial_vars, use = "complete.obs")
 corrplot(corr_matrix, method = "color", type = "upper", tl.cex = 0.8)
 
-# VIF
 model_check <- glm(
   hot ~ price + new_listings + inventory + days_pending +
     sale_to_list + market_heat_index + region_census,
-  data = df_model,
-  family = binomial
+  data = train, family = binomial
 )
+cat("Initial training-only VIF:\n")
+print(vif(model_check))
 
-vif(model_check)
-
-# Removing new listings due to multicollinearity issues
-df_model <- df_model %>%
-  select(-new_listings)
-
-vars <- df_model %>%
-  select(price, inventory, days_pending, sale_to_list, market_heat_index)
-corr_matrix <- cor(vars, use = "complete.obs")
-corr_matrix
-corrplot(corr_matrix, method = "color", type = "upper", tl.cex = 0.8)
-
-model_check <- glm(
+# Evaluate the specification without new_listings.
+# The choice must be justified by the training-only VIF results above.
+model_check_reduced <- glm(
   hot ~ price + inventory + days_pending +
     sale_to_list + market_heat_index + region_census,
-  data = df_model,
-  family = binomial
+  data = train, family = binomial
 )
-vif(model_check)
+cat("Reduced training-only VIF:\n")
+print(vif(model_check_reduced))
 
-# No multicollinearity issues
+reduced_vars <- train %>%
+  select(price, inventory, days_pending, sale_to_list, market_heat_index)
 
-# Linearity ####
-df_model$logit <- log(
-  predict(model_check, type = "response") /
-    (1 - predict(model_check, type = "response"))
-)
-
-# try log
-plot(df_model$price, df_model$logit,
-     main = "Price vs Logit")
-lines(lowess(df_model$price, df_model$logit), col="red")
-
-# try log
-plot(df_model$inventory, df_model$logit,
-     main = "Inventory vs Logit")
-lines(lowess(df_model$inventory, df_model$logit), col="red")
-
-# try log
-plot(df_model$days_pending, df_model$logit,
-     main = "Days Pending vs Logit")
-lines(lowess(df_model$days_pending, df_model$logit), col="red")
-
-# logs
-df_model$log_price <- log(df_model$price)
-df_model$log_inventory <- log(df_model$inventory)
-df_model$log_days_pending <- log(df_model$days_pending)
-
-# Think improvement
-plot(df_model$log_price, df_model$logit,
-     main = "Log(Price) vs Logit")
-lines(lowess(df_model$log_price, df_model$logit), col="red")
-
-# Improved
-plot(df_model$log_inventory, df_model$logit,
-     main = "Log(Inventory) vs Logit")
-lines(lowess(df_model$log_inventory, df_model$logit), col="red")
-
-# Improved
-plot(df_model$log_days_pending, df_model$logit,
-     main = "Log(Days Pending) vs Logit")
-lines(lowess(df_model$log_days_pending, df_model$logit), col="red")
-
-# Final logistic regression model
-model_final <- glm(
-  hot ~ log_price + log_inventory + log_days_pending +
-    sale_to_list + market_heat_index + region_census,
-  data = df_model,
-  family = binomial
+corrplot(
+  cor(reduced_vars),
+  method = "color",
+  type = "upper",
+  tl.cex = 0.5,
+  cl.cex = 0.5,
+  mar = c(0, 0, 0, 0)
 )
 
-# Outlier ####
-# Cook
-cooks_d <- cooks.distance(model_final)
+# Training-only functional-form exploration ####
+# Fitted logits are exploratory plots, not a formal test of logit linearity.
+train$exploratory_logit <- predict(model_check_reduced, type = "link")
+plot_with_smoother <- function(x, y, label) {
+  plot(x, y, main = label, xlab = label, ylab = "Fitted log-odds")
+  lines(lowess(x, y), col = "red")
+}
+plot_with_smoother(train$price, train$exploratory_logit, "Price")
+plot_with_smoother(train$inventory, train$exploratory_logit, "Inventory")
+plot_with_smoother(train$days_pending, train$exploratory_logit, "Days pending")
 
-plot(cooks_d, type = "h",
-     main = "Cook's Distance",
-     ylab = "Cook's D")
+# Log transformations do not require estimating parameters from the test set.
+train <- train %>%
+  mutate(log_price = log(price),
+         log_inventory = log(inventory),
+         log_days_pending = log(days_pending))
+test <- test %>%
+  mutate(log_price = log(price),
+         log_inventory = log(inventory),
+         log_days_pending = log(days_pending))
 
-abline(h = 4/length(cooks_d), col = "red")
+plot_with_smoother(train$log_price, train$exploratory_logit, "Log(price)")
+plot_with_smoother(train$log_inventory, train$exploratory_logit, "Log(inventory)")
+plot_with_smoother(train$log_days_pending, train$exploratory_logit, "Log(days pending)")
 
-# Leverage
-lev <- hatvalues(model_final)
-
-plot(lev, type = "h",
-     main = "Leverage",
-     ylab = "Hat Values")
-
-abline(h = 2*mean(lev), col = "red")
-
-# Residuals
-res <- residuals(model_final, type = "deviance")
-
-plot(res,
-     main = "Deviance Residuals",
-     ylab = "Residuals")
-
-abline(h = c(-3, 3), col = "red")
-
-set.seed(1)
-
-# Split ####
-# Splitting based on time so future data won't be in training and past data won't be in testing
-# (forgot to do earlier)
-
-train <- df_model %>% filter(date < as.Date("2022-01-01")) # about 60%
-test  <- df_model %>% filter(date >= as.Date("2022-01-01")) # about 40%
-
+# Baseline model trained only on pre-2022 observations ####
 model_final2 <- glm(
   hot ~ log_price + log_inventory + log_days_pending +
     sale_to_list + market_heat_index + region_census,
-  data = train,
-  family = binomial
+  data = train, family = binomial
 )
+cat("Baseline training VIF:\n")
+print(vif(model_final2))
 
-# Rechecks ####
-# linearity recheck (linear enough)
-train$logit <- log(
-  predict(model_final2, type = "response") /
-    (1 - predict(model_final2, type = "response"))
-)
+# Training-only diagnostics
+cooks_d <- cooks.distance(model_final2)
+plot(cooks_d, type = "h", main = "Training Cook's distance", ylab = "Cook's D")
+abline(h = 4 / length(cooks_d), col = "red")
+lev <- hatvalues(model_final2)
+plot(lev, type = "h", main = "Training leverage", ylab = "Hat values")
+abline(h = 2 * mean(lev), col = "red")
+res <- residuals(model_final2, type = "deviance")
+plot(res, main = "Training deviance residuals", ylab = "Residuals")
+abline(h = c(-3, 3), col = "red")
 
-plot(train$log_price, train$logit)
-lines(lowess(train$log_price, train$logit), col="red")
-
-# multicollinearity recheck (good)
-vif(model_final2)
-
-# outlier recheck (looks good)
-plot(model_final2)
-
-# Interactions ####
-# checking sale_to_list * market_heat_index, log_inventory * market_heat_index, and log_days_pending * market_heat_index
-# sale and market
+# Training-only interaction comparisons ####
 model_interact <- glm(
   hot ~ log_price + log_inventory + log_days_pending +
     sale_to_list * market_heat_index + region_census,
-  data = train,
-  family = binomial
+  data = train, family = binomial
 )
-
-# is both significant and lowers aic will add
-AIC(model_final2, model_interact) # 18281.50
-anova(model_final2, model_interact, test = "Chisq") 
-
 model_interact2 <- glm(
   hot ~ log_price + log_inventory * market_heat_index +
     log_days_pending + sale_to_list + region_census,
-  data = train,
-  family = binomial
+  data = train, family = binomial
 )
-
-# not sig or aic lowering (not using)
-AIC(model_final2, model_interact2)
-
-anova(model_final2, model_interact2, test = "Chisq")
-
 model_interact3 <- glm(
-  hot ~ log_price + log_inventory + log_days_pending +
-    log_days_pending * market_heat_index +
-    sale_to_list + region_census,
-  data = train,
-  family = binomial
+  hot ~ log_price + log_inventory +
+    log_days_pending * market_heat_index + sale_to_list + region_census,
+  data = train, family = binomial
 )
-
-# both sig and lower aic (use)
-AIC(model_final2, model_interact3) #18285.67
-
-anova(model_final2, model_interact3, test = "Chisq")
-
 model_final3 <- glm(
   hot ~ log_price + log_inventory + log_days_pending +
     sale_to_list * market_heat_index +
-    log_days_pending * market_heat_index +
-    region_census,
-  data = train,
-  family = binomial
+    log_days_pending * market_heat_index + region_census,
+  data = train, family = binomial
 )
 
-AIC(model_final2, model_final3) # 18275.93 (lower than original and with just one int)
-anova(model_final2, model_final3, test = "Chisq") # sig with two interactions
+cat("Training AIC comparisons:\n")
+print(AIC(model_final2, model_interact, model_interact2,
+          model_interact3, model_final3))
+cat("Likelihood-ratio tests (training data):\n")
+print(anova(model_final2, model_interact, test = "Chisq"))
+print(anova(model_final2, model_interact2, test = "Chisq"))
+print(anova(model_final2, model_interact3, test = "Chisq"))
+print(anova(model_final2, model_final3, test = "Chisq"))
 
-summary(model_final3)
-
-# VIF is affected by interactions
-vif(model_final3)
-
-# Try centering
+# Center interaction variables using training means only ####
 mu_heat <- mean(train$market_heat_index)
 mu_sale <- mean(train$sale_to_list)
 mu_days <- mean(train$log_days_pending)
 
-train$market_heat_c <- train$market_heat_index - mu_heat
-test$market_heat_c  <- test$market_heat_index - mu_heat
+center_predictors <- function(data) {
+  data %>% mutate(
+    market_heat_c = market_heat_index - mu_heat,
+    sale_to_list_c = sale_to_list - mu_sale,
+    log_days_pending_c = log_days_pending - mu_days
+  )
+}
+train <- center_predictors(train)
+test <- center_predictors(test)
 
-train$sale_to_list_c <- train$sale_to_list - mu_sale
-test$sale_to_list_c  <- test$sale_to_list - mu_sale
-
-train$log_days_pending_c <- train$log_days_pending - mu_days
-test$log_days_pending_c  <- test$log_days_pending - mu_days
-
-# Final Model ####
+# Final model ####
 model_final4 <- glm(
   hot ~ log_price + log_inventory + log_days_pending_c +
     sale_to_list_c * market_heat_c +
-    log_days_pending_c * market_heat_c +
-    region_census,
-  data = train,
-  family = binomial
+    log_days_pending_c * market_heat_c + region_census,
+  data = train, family = binomial
 )
+cat("Final model summary:\n")
+print(summary(model_final4))
+cat("Final training VIF/GVIF:\n")
+print(vif(model_final4))
+cat("Final training AIC:", AIC(model_final4), "\n")
 
-vif(model_final4) # fixed
-
-summary(model_final4) # looks good still
-
-AIC(model_final4) # 18275.93 good
-
-# Evaluations ####
-# acc, sens, spec
+# One-time out-of-sample evaluation ####
 pred <- predict(model_final4, newdata = test, type = "response")
-pred_class <- pred > 0.5
-
-table(Predicted = pred > 0.5, Actual = test$hot)
-cm <- table(Predicted = pred_class, Actual = test$hot)
-
-TN <- cm[1,1]
-FP <- cm[2,1]
-FN <- cm[1,2]
-TP <- cm[2,2]
-
+pred_class <- as.integer(pred > 0.5)
+cm <- table(
+  Predicted = factor(pred_class, levels = c(0, 1)),
+  Actual = factor(test$hot, levels = c(0, 1))
+)
+print(cm)
+TN <- cm["0", "0"]
+FP <- cm["1", "0"]
+FN <- cm["0", "1"]
+TP <- cm["1", "1"]
 accuracy <- (TP + TN) / sum(cm)
-sensitivity <- TP / (TP + FN) 
-specificity <- TN / (TN + FP)
+sensitivity <- if ((TP + FN) > 0) TP / (TP + FN) else NA_real_
+specificity <- if ((TN + FP) > 0) TN / (TN + FP) else NA_real_
+roc_obj <- roc(response = test$hot, predictor = pred,
+               levels = c(0, 1), direction = "<", quiet = TRUE)
+auc_value <- as.numeric(auc(roc_obj))
+plot(roc_obj, main = "Test ROC")
 
-accuracy # 0.715
-sensitivity # 0.663
-specificity # 0.744
+cat(sprintf("Test accuracy: %.3f\n", accuracy))
+cat(sprintf("Test sensitivity: %.3f\n", sensitivity))
+cat(sprintf("Test specificity: %.3f\n", specificity))
+cat(sprintf("Test ROC AUC: %.3f\n", auc_value))
 
-# auc
-roc_obj <- roc(test$hot, pred)
-auc(roc_obj)
-
-plot(roc_obj)
-
-summary(model_final4)
-
-# The final logistic regression model achieved approximately:
-# - 71.5% test accuracy
-# - 0.663 sensitivity
-# - 0.744 specificity
-# - 0.77 AUC
-
-# Inventory levels, transaction speed, and market heat indicators
-# were among the strongest predictors of housing market growth.
-
-# Interaction effects improved model fit, suggesting that the effect
-# of pricing competitiveness and pending days depends partly on overall
-# market heat conditions.
-
-# Overall, the model demonstrated moderate predictive ability while
-# remaining interpretable and statistically stable.
+# Interpretation notes:
+# - This is a same-month classification model, not a forecast of future growth.
+# - The target is above the PRE-2022 training median, applied consistently to test.
+# - Missing market indicators restrict the analysis to complete metro-months.
 
