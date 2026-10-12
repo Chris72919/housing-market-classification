@@ -5,6 +5,14 @@ This project uses Zillow metro-level housing data to classify housing markets as
 Housing market datasets sourced from Zillow Research Data:
 https://www.zillow.com/research/data/
 
+## Target Variable
+The response variable is a binary indicator representing whether a housing market experienced above-median home price growth.
+
+- Hot Market (1): Home price growth above the median.
+- Not Hot Market (0): Home price growth at or below the median.
+
+This classification serves as the dependent variable in the logistic regression models.
+
 ## Methods
 - Logistic Regression
 - Interaction Effects
